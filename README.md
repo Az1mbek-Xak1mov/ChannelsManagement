@@ -28,6 +28,9 @@ cp .env.example .env
 Required variables:
 - `BOT_TOKEN`: Get from [@BotFather](https://t.me/BotFather)
 - `OPENAI_API_KEY`: Get from [OpenAI Platform](https://platform.openai.com/api-keys)
+- `SOURCE_CHANNEL`: Channel username to listen to (e.g. `@azims_vlog`)
+- `DESTINATION_CHANNEL`: Channel username to publish to (e.g. `@testing_channel_tel`)
+- `OPENAI_MODEL`: OpenAI model name (default: `gpt-5.4`)
 
 ### 3. Bot Permissions
 
@@ -54,7 +57,7 @@ python bot.py
 
 ## Configuration
 
-Edit `config.py` to change:
+Set values in `.env` to change:
 - `SOURCE_CHANNEL`: Channel to listen to
 - `DESTINATION_CHANNEL`: Channel to publish to
-- `OPENAI_MODEL`: OpenAI model to use (default: gpt-4o-mini)
+- `OPENAI_MODEL`: OpenAI model to use (default: `gpt-5.4`)
