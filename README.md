@@ -28,15 +28,15 @@ cp .env.example .env
 Required variables:
 - `BOT_TOKEN`: Get from [@BotFather](https://t.me/BotFather)
 - `OPENAI_API_KEY`: Get from [OpenAI Platform](https://platform.openai.com/api-keys)
-- `SOURCE_CHANNEL`: Channel username to listen to (e.g. `@azims_vlog`)
-- `DESTINATION_CHANNEL`: Channel username to publish to (e.g. `@testing_channel_tel`)
+- `SOURCE_CHANNEL`: Channel username to listen 
+- `DESTINATION_CHANNEL`: Channel username to publish
 - `OPENAI_MODEL`: OpenAI model name (default: `gpt-5.4`)
 
 ### 3. Bot Permissions
 
 The bot must be added as an **administrator** to both channels:
-- Source channel: @malepeg (needs read access)
-- Destination channel: @nazirovlix_blog (needs post access)
+- Source channel: (needs read access)
+- Destination channel: (needs post access)
 
 ### 4. Run the Bot
 
