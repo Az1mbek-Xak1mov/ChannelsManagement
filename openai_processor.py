@@ -50,7 +50,7 @@ async def process_text(text: str) -> str | None:
                 {"role": "user", "content": text}
             ],
             temperature=0.3,
-            max_tokens=2000
+            max_completion_tokens=2000
         )
         
         result = response.choices[0].message.content.strip()
