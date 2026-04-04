@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import asyncio
 import re
 from urllib.parse import urljoin
+from io import BytesIO
 
 import requests
 from bs4 import BeautifulSoup
@@ -110,16 +111,45 @@ def send_post_to_destination(
     media_url: Optional[str] = None,
 ) -> bool:
     """Send post (text/media) to destination channel via Telegram Bot API."""
-    def _send(send_url: str, payload: dict) -> tuple[bool, str]:
+    def _send(send_url: str, payload: dict, files: Optional[dict] = None) -> tuple[bool, str]:
         try:
-            response = requests.post(send_url, data=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-            response.raise_for_status()
+            response = requests.post(
+                send_url,
+                data=payload,
+                files=files,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
             data = response.json()
+            if response.status_code >= 400:
+                return False, data.get("description", response.text)
             if not data.get("ok"):
-                return False, str(data)
+                return False, data.get("description", str(data))
             return True, "ok"
         except (requests.RequestException, ValueError) as exc:
             return False, str(exc)
+
+    def _download_media(url: str) -> tuple[Optional[BytesIO], Optional[str], Optional[str]]:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": build_source_web_url(SOURCE_CHANNEL),
+        }
+        try:
+            r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+            r.raise_for_status()
+            ctype = r.headers.get("Content-Type", "")
+            if "image" in ctype:
+                filename = "media.jpg"
+            elif "video" in ctype:
+                filename = "media.mp4"
+            else:
+                filename = "media.bin"
+            return BytesIO(r.content), filename, ctype
+        except requests.RequestException as exc:
+            return None, None, str(exc)
 
     if media_type == "photo" and media_url:
         ok, err = _send(
@@ -132,7 +162,23 @@ def send_post_to_destination(
         )
         if ok:
             return True
-        logger.warning("sendPhoto failed, fallback to text. Error: %s", err)
+        logger.warning("sendPhoto by URL failed, trying file upload. Error: %s", err)
+
+        media_bytes, filename, download_err = _download_media(media_url)
+        if media_bytes:
+            ok, err = _send(
+                f"https://api.telegram.org/bot{bot_token}/sendPhoto",
+                {
+                    "chat_id": destination_channel,
+                    **({"caption": text} if text.strip() else {}),
+                },
+                files={"photo": (filename or "photo.jpg", media_bytes.getvalue())},
+            )
+            if ok:
+                return True
+            logger.warning("sendPhoto by file failed, fallback to text. Error: %s", err)
+        else:
+            logger.warning("Media download failed, fallback to text. Error: %s", download_err)
 
     elif media_type == "video" and media_url:
         ok, err = _send(
@@ -145,7 +191,23 @@ def send_post_to_destination(
         )
         if ok:
             return True
-        logger.warning("sendVideo failed, fallback to text. Error: %s", err)
+        logger.warning("sendVideo by URL failed, trying file upload. Error: %s", err)
+
+        media_bytes, filename, download_err = _download_media(media_url)
+        if media_bytes:
+            ok, err = _send(
+                f"https://api.telegram.org/bot{bot_token}/sendVideo",
+                {
+                    "chat_id": destination_channel,
+                    **({"caption": text} if text.strip() else {}),
+                },
+                files={"video": (filename or "video.mp4", media_bytes.getvalue())},
+            )
+            if ok:
+                return True
+            logger.warning("sendVideo by file failed, fallback to text. Error: %s", err)
+        else:
+            logger.warning("Media download failed, fallback to text. Error: %s", download_err)
 
     if not text.strip():
         logger.info("Post has no text and media upload failed/unsupported, skipping send")
