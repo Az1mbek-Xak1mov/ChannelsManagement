@@ -1,157 +1,223 @@
-import asyncio
 import logging
-from aiogram import Bot, Dispatcher, Router
-from aiogram.types import Message
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramConflictError
+import time
+from typing import Optional, Tuple
+import asyncio
+import re
+from urllib.parse import urljoin
 
-from config import BOT_TOKEN, SOURCE_CHANNEL, DESTINATION_CHANNEL
+import requests
+from bs4 import BeautifulSoup
+from config import BOT_TOKEN, SOURCE_CHANNEL, DESTINATION_CHANNEL, OPENAI_API_KEY
 from openai_processor import process_text
+
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-router = Router()
+CHECK_INTERVAL_SECONDS = 10
+REQUEST_TIMEOUT_SECONDS = 15
 
 
-def get_source_channel_id(source: str) -> str:
-    """Convert channel username to comparable format."""
-    return source.lstrip("@").lower()
+def build_source_web_url(source_channel: str) -> str:
+    channel_username = source_channel.strip().lstrip("@")
+    return f"https://t.me/s/{channel_username}"
 
 
-@router.channel_post()
-async def handle_channel_post(message: Message, bot: Bot):
-    """Handle incoming channel posts from the source channel."""
-    
-    if not message.sender_chat:
-        return
-    
-    chat_username = message.sender_chat.username
-    if not chat_username:
-        return
-    
-    source_username = get_source_channel_id(SOURCE_CHANNEL)
-    if chat_username.lower() != source_username:
-        return
-    
-    logger.info(f"Received post from {SOURCE_CHANNEL}, message_id: {message.message_id}")
-
-    has_media = any([
-        message.photo,
-        message.video,
-        message.document,
-        message.animation,
-        message.audio,
-        message.voice,
-        message.video_note,
-        message.sticker,
-    ])
-
-    original_text = message.text or message.caption or ""
-
-    if not original_text.strip():
-        logger.info(f"Post {message.message_id} has no text/caption to evaluate, skipping")
-        return
-    
-    translated_text = await process_text(original_text)
-    
-    if translated_text is None:
-        logger.info(f"Post {message.message_id} skipped (filtered by OpenAI)")
-        return
-    
-    try:
-        if message.photo:
-            photo = message.photo[-1]
-            await bot.send_photo(
-                chat_id=DESTINATION_CHANNEL,
-                photo=photo.file_id,
-                caption=translated_text,
-                parse_mode=ParseMode.HTML
-            )
-            logger.info(f"Published photo with translated caption to {DESTINATION_CHANNEL}")
-
-        elif message.video:
-            await bot.send_video(
-                chat_id=DESTINATION_CHANNEL,
-                video=message.video.file_id,
-                caption=translated_text,
-                parse_mode=ParseMode.HTML
-            )
-            logger.info(f"Published video with translated caption to {DESTINATION_CHANNEL}")
-
-        elif message.document:
-            await bot.send_document(
-                chat_id=DESTINATION_CHANNEL,
-                document=message.document.file_id,
-                caption=translated_text,
-                parse_mode=ParseMode.HTML
-            )
-            logger.info(f"Published document with translated caption to {DESTINATION_CHANNEL}")
-
-        elif message.animation:
-            await bot.send_animation(
-                chat_id=DESTINATION_CHANNEL,
-                animation=message.animation.file_id,
-                caption=translated_text,
-                parse_mode=ParseMode.HTML
-            )
-            logger.info(f"Published animation with translated caption to {DESTINATION_CHANNEL}")
-
-        elif message.audio:
-            await bot.send_audio(
-                chat_id=DESTINATION_CHANNEL,
-                audio=message.audio.file_id,
-                caption=translated_text,
-                parse_mode=ParseMode.HTML
-            )
-            logger.info(f"Published audio with translated caption to {DESTINATION_CHANNEL}")
-
-        elif has_media:
-            logger.info(
-                f"Post {message.message_id} contains unsupported media for caption translation, skipping"
-            )
-
-        else:
-            await bot.send_message(
-                chat_id=DESTINATION_CHANNEL,
-                text=translated_text,
-                parse_mode=ParseMode.HTML
-            )
-            logger.info(f"Published text post to {DESTINATION_CHANNEL}")
-    except Exception as e:
-        logger.error(f"Failed to publish post to {DESTINATION_CHANNEL}: {e}")
+def _extract_photo_url(photo_style: str) -> Optional[str]:
+    # Example style: background-image:url('https://...jpg')
+    match = re.search(r"url\((['\"]?)(.*?)\1\)", photo_style)
+    if not match:
+        return None
+    return match.group(2)
 
 
-async def main():
-    """Initialize and start the bot."""
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is not set in .env file")
-        return
-    
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
-    dp = Dispatcher()
-    dp.include_router(router)
-    
-    logger.info("Bot starting...")
-    logger.info(f"Listening for posts from: {SOURCE_CHANNEL}")
-    logger.info(f"Publishing to: {DESTINATION_CHANNEL}")
-
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot, allowed_updates=["channel_post"])
-    except TelegramConflictError:
-        logger.error(
-            "Telegram conflict: another instance is already using this bot token. "
-            "Stop the other process and run only one instance."
+def scrape_latest_post(source_channel: str) -> Optional[Tuple[int, str, Optional[str], Optional[str]]]:
+    """Scrape latest post ID, text, and media info from the public Telegram web view."""
+    url = build_source_web_url(source_channel)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
         )
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("Failed to fetch source channel page: %s", exc)
+        return None
+
+    try:
+        soup = BeautifulSoup(response.text, "html.parser")
+        message_blocks = soup.select("div.tgme_widget_message_wrap")
+        if not message_blocks:
+            logger.warning("No message blocks found on source page")
+            return None
+
+        latest_block = message_blocks[-1]
+        message_el = latest_block.select_one("div.tgme_widget_message")
+        if not message_el:
+            logger.warning("Latest message element not found")
+            return None
+
+        data_post = message_el.get("data-post", "")
+        if "/" not in data_post:
+            logger.warning("Missing or invalid data-post attribute")
+            return None
+
+        message_id_str = data_post.rsplit("/", 1)[-1]
+        message_id = int(message_id_str)
+
+        text_el = latest_block.select_one("div.tgme_widget_message_text")
+        message_text = text_el.get_text("\n", strip=True) if text_el else ""
+
+        media_type: Optional[str] = None
+        media_url: Optional[str] = None
+
+        video_source_el = latest_block.select_one("video source")
+        video_el = latest_block.select_one("video")
+        if video_source_el and video_source_el.get("src"):
+            media_type = "video"
+            media_url = urljoin("https://t.me", video_source_el.get("src"))
+        elif video_el and video_el.get("src"):
+            media_type = "video"
+            media_url = urljoin("https://t.me", video_el.get("src"))
+        else:
+            photo_wrap_el = latest_block.select_one("a.tgme_widget_message_photo_wrap")
+            if photo_wrap_el:
+                style_value = photo_wrap_el.get("style", "")
+                extracted = _extract_photo_url(style_value)
+                if extracted:
+                    media_type = "photo"
+                    media_url = urljoin("https://t.me", extracted)
+
+        return message_id, message_text, media_type, media_url
+    except (ValueError, AttributeError) as exc:
+        logger.warning("Failed to parse latest message: %s", exc)
+        return None
+
+
+def send_post_to_destination(
+    bot_token: str,
+    destination_channel: str,
+    text: str,
+    media_type: Optional[str] = None,
+    media_url: Optional[str] = None,
+) -> bool:
+    """Send post (text/media) to destination channel via Telegram Bot API."""
+    def _send(send_url: str, payload: dict) -> tuple[bool, str]:
+        try:
+            response = requests.post(send_url, data=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            data = response.json()
+            if not data.get("ok"):
+                return False, str(data)
+            return True, "ok"
+        except (requests.RequestException, ValueError) as exc:
+            return False, str(exc)
+
+    if media_type == "photo" and media_url:
+        ok, err = _send(
+            f"https://api.telegram.org/bot{bot_token}/sendPhoto",
+            {
+                "chat_id": destination_channel,
+                "photo": media_url,
+                **({"caption": text} if text.strip() else {}),
+            },
+        )
+        if ok:
+            return True
+        logger.warning("sendPhoto failed, fallback to text. Error: %s", err)
+
+    elif media_type == "video" and media_url:
+        ok, err = _send(
+            f"https://api.telegram.org/bot{bot_token}/sendVideo",
+            {
+                "chat_id": destination_channel,
+                "video": media_url,
+                **({"caption": text} if text.strip() else {}),
+            },
+        )
+        if ok:
+            return True
+        logger.warning("sendVideo failed, fallback to text. Error: %s", err)
+
+    if not text.strip():
+        logger.info("Post has no text and media upload failed/unsupported, skipping send")
+        return False
+
+    ok, err = _send(
+        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+        {"chat_id": destination_channel, "text": text},
+    )
+    if not ok:
+        logger.error("Failed to send message to destination: %s", err)
+    return ok
+
+
+def main() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is missing in .env")
+    if not SOURCE_CHANNEL:
+        raise RuntimeError("SOURCE_CHANNEL is missing in .env")
+    if not DESTINATION_CHANNEL:
+        raise RuntimeError("DESTINATION_CHANNEL is missing in .env")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is missing in .env")
+
+    logger.info("Starting monitor")
+    logger.info("Source: %s", SOURCE_CHANNEL)
+    logger.info("Destination: %s", DESTINATION_CHANNEL)
+
+    last_seen_message_id: Optional[int] = None
+
+    while True:
+        try:
+            latest = scrape_latest_post(SOURCE_CHANNEL)
+            if latest is None:
+                time.sleep(CHECK_INTERVAL_SECONDS)
+                continue
+
+            message_id, message_text, media_type, media_url = latest
+
+            if last_seen_message_id is None:
+                last_seen_message_id = message_id
+                logger.info("Initialized last seen message ID: %s", message_id)
+            elif message_id > last_seen_message_id:
+                logger.info("New post detected: %s", message_id)
+                processed_text = ""
+                if message_text.strip():
+                    processed = asyncio.run(process_text(message_text))
+                    if processed is None:
+                        logger.info("Post %s skipped by OpenAI filter", message_id)
+                        last_seen_message_id = message_id
+                        time.sleep(CHECK_INTERVAL_SECONDS)
+                        continue
+                    processed_text = processed
+
+                sent = send_post_to_destination(
+                    BOT_TOKEN,
+                    DESTINATION_CHANNEL,
+                    processed_text,
+                    media_type=media_type,
+                    media_url=media_url,
+                )
+                if sent:
+                    logger.info("Forwarded new post %s to destination", message_id)
+                last_seen_message_id = message_id
+            else:
+                logger.debug("No new posts")
+
+        except Exception as exc:
+            logger.exception("Unexpected error in polling loop: %s", exc)
+
+        time.sleep(CHECK_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
