@@ -1,14 +1,10 @@
 import logging
 import time
 import json
-from typing import Optional, Tuple, List
+from typing import Optional
 import asyncio
-import re
-from urllib.parse import urljoin
-from io import BytesIO
 
 import requests
-from bs4 import BeautifulSoup, NavigableString, Tag
 from config import BOT_TOKEN, SOURCE_CHANNEL, DESTINATION_CHANNEL, OPENAI_API_KEY
 from openai_processor import process_text
 
@@ -19,372 +15,225 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CHECK_INTERVAL_SECONDS = 10
-REQUEST_TIMEOUT_SECONDS = 15
+POLL_TIMEOUT = 30  # long-polling timeout for getUpdates
+MEDIA_GROUP_WAIT = 2  # seconds to wait for more media group messages
 
 
-def build_source_web_url(source_channel: str) -> str:
-    channel_username = source_channel.strip().lstrip("@")
-    return f"https://t.me/s/{channel_username}"
+class TelegramBot:
+    """Telegram Bot API wrapper for channel forwarding."""
+
+    def __init__(self, token: str):
+        self.token = token
+        self.base_url = f"https://api.telegram.org/bot{token}"
+        self.offset: Optional[int] = None
+
+    def _call(self, method: str, data: Optional[dict] = None, timeout: int = 60) -> Optional[dict]:
+        """Call Telegram Bot API method."""
+        url = f"{self.base_url}/{method}"
+        try:
+            resp = requests.post(url, json=data or {}, timeout=timeout)
+            result = resp.json()
+            if not result.get("ok"):
+                logger.error("API %s failed: %s", method, result.get("description"))
+                return None
+            return result.get("result")
+        except requests.RequestException as exc:
+            logger.error("API %s request failed: %s", method, exc)
+            return None
+
+    def get_updates(self) -> list[dict]:
+        """Long-poll for new updates."""
+        data = {
+            "timeout": POLL_TIMEOUT,
+            "allowed_updates": ["channel_post"],
+        }
+        if self.offset is not None:
+            data["offset"] = self.offset
+        result = self._call("getUpdates", data, timeout=POLL_TIMEOUT + 10)
+        return result if result else []
+
+    def send_message(self, chat_id: str, text: str) -> bool:
+        """Send a text message."""
+        result = self._call("sendMessage", {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+        })
+        return result is not None
+
+    def copy_message(self, from_chat: str, to_chat: str, message_id: int,
+                     caption: Optional[str] = None) -> bool:
+        """Copy a message from one chat to another, optionally with new caption."""
+        data = {
+            "chat_id": to_chat,
+            "from_chat_id": from_chat,
+            "message_id": message_id,
+        }
+        if caption is not None:
+            data["caption"] = caption
+            data["parse_mode"] = "Markdown"
+        result = self._call("copyMessage", data)
+        return result is not None
+
+    def send_media_group(self, chat_id: str, media: list[dict]) -> bool:
+        """Send a media group (multiple photos/videos)."""
+        result = self._call("sendMediaGroup", {
+            "chat_id": chat_id,
+            "media": media,
+        })
+        return result is not None
 
 
-def _extract_photo_url(photo_style: str) -> Optional[str]:
-    # Example style: background-image:url('https://...jpg')
-    match = re.search(r"url\((['\"]?)(.*?)\1\)", photo_style)
-    if not match:
-        return None
-    return match.group(2)
-
-
-# Regex matching strings that are ONLY emoji (incl. keycaps, ZWJ sequences, flags, variation selectors)
-_EMOJI_ONLY_RE = re.compile(
-    r'^[\s'
-    r'\U0001F600-\U0001F64F'   # emoticons
-    r'\U0001F300-\U0001F5FF'   # symbols & pictographs
-    r'\U0001F680-\U0001F6FF'   # transport & map
-    r'\U0001F1E0-\U0001F1FF'   # flags
-    r'\U0001F900-\U0001F9FF'   # supplemental symbols
-    r'\U0001FA00-\U0001FA6F'   # chess symbols
-    r'\U0001FA70-\U0001FAFF'   # symbols extended-A
-    r'\U00002702-\U000027B0'   # dingbats
-    r'\U0000FE00-\U0000FE0F'   # variation selectors
-    r'\U0000200D'              # ZWJ
-    r'\U000020E3'              # combining enclosing keycap
-    r'\U00002600-\U000026FF'   # misc symbols
-    r'\U00002B50-\U00002B55'   # stars
-    r'\U0000231A-\U0000231B'   # watch/hourglass
-    r'\U00002934-\U00002935'   # arrows
-    r'\U000025AA-\U000025FE'   # geometric shapes
-    r'\U00000030-\U00000039'   # digits 0-9 (for keycap sequences like 2️⃣)
-    r'\U0000002A\U00000023'    # * and # for keycap
-    r']+$'
-)
-
-
-def _is_emoji_only(text: str) -> bool:
-    """Return True if text consists only of emoji characters and whitespace."""
-    return bool(text.strip()) and bool(_EMOJI_ONLY_RE.match(text))
-
-
-def _escape_markdown(text: str) -> str:
-    """Escape Markdown special characters, but leave already-formed links intact."""
-    # We only escape characters that could break Markdown parsing
-    # but NOT inside [...](url) constructs which we build ourselves
-    for ch in ('\\', '`', '*', '_', '{', '}', '[', ']', '(', ')', '#', '+', '-', '.', '!'):
-        text = text.replace(ch, f'\\{ch}')
-    return text
-
-
-def extract_text_with_links(element: Tag) -> str:
-    """Walk HTML tree and convert to Markdown-style text.
-
-    Preserves:
-    - <a> tags as [text](url)
-    - <b>/<strong> as **text**
-    - <i>/<em> as _text_
-    - <br> as newline
-    - Inline elements (spans, tg-emoji, etc.) stay on the same line
-    """
-    parts: list[str] = []
-
-    for child in element.children:
-        if isinstance(child, NavigableString):
-            text = str(child)
-            # Escape markdown chars in plain text
-            text = _escape_markdown(text)
-            parts.append(text)
-        elif isinstance(child, Tag):
-            tag_name = child.name.lower()
-
-            if tag_name == 'br':
-                parts.append('\n')
-            elif tag_name == 'a':
-                href = child.get('href', '')
-                link_text = child.get_text()
-                if href and link_text.strip():
-                    # Keep the link in Markdown format
-                    safe_text = _escape_markdown(link_text)
-                    parts.append(f'[{safe_text}]({href})')
-                elif link_text.strip():
-                    parts.append(_escape_markdown(link_text))
-            elif tag_name in ('b', 'strong'):
-                inner = extract_text_with_links(child)
-                # Don't wrap emojis in bold — they render badly as **😱**
-                if _is_emoji_only(inner):
-                    parts.append(inner)
-                else:
-                    parts.append(f'**{inner}**')
-            elif tag_name in ('i', 'em'):
-                inner = extract_text_with_links(child)
-                parts.append(f'_{inner}_')
-            elif tag_name in ('code',):
-                inner = child.get_text()
-                parts.append(f'`{inner}`')
-            elif tag_name in ('pre',):
-                inner = child.get_text()
-                parts.append(f'```\n{inner}\n```')
-            elif tag_name in ('div', 'p'):
-                inner = extract_text_with_links(child)
-                parts.append(f'\n{inner}\n')
-            else:
-                # Inline elements: span, tg-emoji, etc. - keep on same line
-                inner = extract_text_with_links(child)
-                parts.append(inner)
-
-    result = ''.join(parts)
-    # Clean up excessive newlines
-    result = re.sub(r'\n{3,}', '\n\n', result)
-    return result.strip()
-
-
-def scrape_latest_post(source_channel: str) -> Optional[Tuple[int, str, List[Tuple[str, str]]]]:
-    """Scrape latest post ID, text, and ALL media from the public Telegram web view.
+def _get_file_id(message: dict) -> Optional[tuple[str, str]]:
+    """Extract (media_type, file_id) from a message.
 
     Returns:
-        (message_id, message_text_markdown, [(media_type, media_url), ...])
+        ("photo", file_id) or ("video", file_id) or ("document", file_id)
+        or ("animation", file_id) or None
     """
-    url = build_source_web_url(source_channel)
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
-    }
-
-    try:
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        logger.warning("Failed to fetch source channel page: %s", exc)
-        return None
-
-    try:
-        soup = BeautifulSoup(response.text, "html.parser")
-        message_blocks = soup.select("div.tgme_widget_message_wrap")
-        if not message_blocks:
-            logger.warning("No message blocks found on source page")
-            return None
-
-        latest_block = message_blocks[-1]
-        message_el = latest_block.select_one("div.tgme_widget_message")
-        if not message_el:
-            logger.warning("Latest message element not found")
-            return None
-
-        data_post = message_el.get("data-post", "")
-        if "/" not in data_post:
-            logger.warning("Missing or invalid data-post attribute")
-            return None
-
-        message_id_str = data_post.rsplit("/", 1)[-1]
-        message_id = int(message_id_str)
-
-        # ---- Extract text with links preserved as Markdown ----
-        text_el = latest_block.select_one("div.tgme_widget_message_text")
-        if text_el:
-            message_text = extract_text_with_links(text_el)
-        else:
-            message_text = ""
-
-        # ---- Collect ALL media items ----
-        media_items: List[Tuple[str, str]] = []
-
-        # Collect all videos
-        for vid_source in latest_block.select("video source[src]"):
-            src = vid_source.get("src")
-            if src:
-                media_items.append(("video", urljoin("https://t.me", src)))
-
-        # Also check <video src="..."> directly (without <source>)
-        for vid in latest_block.select("video[src]"):
-            src = vid.get("src")
-            if src:
-                full_url = urljoin("https://t.me", src)
-                # Avoid duplicates from <video><source> already captured
-                if not any(u == full_url for _, u in media_items):
-                    media_items.append(("video", full_url))
-
-        # Collect all photos
-        for photo_el in latest_block.select("a.tgme_widget_message_photo_wrap"):
-            style_value = photo_el.get("style", "")
-            extracted = _extract_photo_url(style_value)
-            if extracted:
-                media_items.append(("photo", urljoin("https://t.me", extracted)))
-
-        logger.debug(
-            "Scraped post %s: text_len=%d, media_count=%d",
-            message_id, len(message_text), len(media_items)
-        )
-        return message_id, message_text, media_items
-    except (ValueError, AttributeError) as exc:
-        logger.warning("Failed to parse latest message: %s", exc)
-        return None
+    if "photo" in message:
+        # photo is an array of sizes, take the largest
+        return "photo", message["photo"][-1]["file_id"]
+    if "video" in message:
+        return "video", message["video"]["file_id"]
+    if "animation" in message:
+        return "animation", message["animation"]["file_id"]
+    if "document" in message:
+        return "document", message["document"]["file_id"]
+    if "audio" in message:
+        return "audio", message["audio"]["file_id"]
+    if "voice" in message:
+        return "voice", message["voice"]["file_id"]
+    if "video_note" in message:
+        return "video_note", message["video_note"]["file_id"]
+    return None
 
 
-def send_post_to_destination(
-    bot_token: str,
-    destination_channel: str,
-    text: str,
-    media_items: Optional[List[Tuple[str, str]]] = None,
-) -> bool:
-    """Send post (text/media) to destination channel via Telegram Bot API.
+def _get_text(message: dict) -> str:
+    """Get text or caption from a message."""
+    return message.get("text") or message.get("caption") or ""
 
-    Supports single media, media groups, and text-only posts.
-    Text is sent with parse_mode=Markdown so links render.
-    """
-    base_url = f"https://api.telegram.org/bot{bot_token}"
 
-    def _send(send_url: str, payload: dict, files: Optional[dict] = None) -> tuple[bool, str]:
-        try:
-            response = requests.post(
-                send_url,
-                data=payload,
-                files=files,
-                timeout=60,  # larger timeout for media uploads
-            )
-            data = response.json()
-            if response.status_code >= 400:
-                return False, data.get("description", response.text)
-            if not data.get("ok"):
-                return False, data.get("description", str(data))
-            return True, "ok"
-        except (requests.RequestException, ValueError) as exc:
-            return False, str(exc)
+def _get_source_chat_id(message: dict) -> Optional[int]:
+    """Get the chat ID from a channel post."""
+    chat = message.get("chat", {})
+    return chat.get("id")
 
-    def _download_media(url: str) -> tuple[Optional[BytesIO], Optional[str], Optional[str]]:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Referer": build_source_web_url(SOURCE_CHANNEL),
-        }
-        try:
-            r = requests.get(url, headers=headers, timeout=30)
-            r.raise_for_status()
-            ctype = r.headers.get("Content-Type", "")
-            if "image" in ctype:
-                filename = "media.jpg"
-            elif "video" in ctype:
-                filename = "media.mp4"
-            else:
-                filename = "media.bin"
-            return BytesIO(r.content), filename, ctype
-        except requests.RequestException as exc:
-            return None, None, str(exc)
 
-    if not media_items:
-        media_items = []
+def _normalize_channel(channel: str) -> str:
+    """Normalize channel identifier — ensure @ prefix for usernames."""
+    channel = channel.strip()
+    if channel.startswith("-100") or channel.startswith("-"):
+        return channel  # numeric ID
+    if not channel.startswith("@"):
+        return f"@{channel}"
+    return channel
 
-    # ---- CASE 1: Media group (2+ items) -> sendMediaGroup ----
-    if len(media_items) >= 2:
-        media_json = []
-        files_dict = {}
-        for idx, (mtype, murl) in enumerate(media_items):
-            media_bytes, filename, dl_err = _download_media(murl)
-            attach_key = f"media_{idx}"
-            entry = {
-                "type": mtype,  # "photo" or "video"
-            }
-            if idx == 0 and text.strip():
-                entry["caption"] = text
-                entry["parse_mode"] = "Markdown"
-            if media_bytes:
-                entry["media"] = f"attach://{attach_key}"
-                files_dict[attach_key] = (filename or f"media_{idx}", media_bytes.getvalue())
-            else:
-                # Fallback to URL if download failed
-                logger.warning("Media %d download failed (%s), trying URL", idx, dl_err)
-                entry["media"] = murl
-            media_json.append(entry)
 
-        ok, err = _send(
-            f"{base_url}/sendMediaGroup",
-            {
-                "chat_id": destination_channel,
-                "media": json.dumps(media_json),
-            },
-            files=files_dict if files_dict else None,
+def _matches_source(message: dict, source_channel: str) -> bool:
+    """Check if a channel_post is from our source channel."""
+    chat = message.get("chat", {})
+    username = chat.get("username", "")
+    chat_id = str(chat.get("id", ""))
+
+    source = source_channel.strip().lstrip("@")
+    return username == source or chat_id == source or chat_id == f"-100{source}"
+
+
+def forward_single_message(bot: TelegramBot, message: dict,
+                           source_channel: str, dest_channel: str) -> bool:
+    """Process and forward a single message (no media group)."""
+    original_text = _get_text(message)
+    has_media = _get_file_id(message) is not None
+    message_id = message.get("message_id")
+
+    # Process text through OpenAI
+    processed_text = ""
+    if original_text.strip():
+        processed = asyncio.run(process_text(original_text))
+        if processed is None:
+            logger.info("Post %s skipped by OpenAI filter", message_id)
+            return False
+        processed_text = processed
+
+    if has_media:
+        # Copy message with new caption (preserves media via file_id, no download)
+        ok = bot.copy_message(
+            from_chat=source_channel,
+            to_chat=dest_channel,
+            message_id=message_id,
+            caption=processed_text if processed_text else None,
         )
         if ok:
+            logger.info("Forwarded post %s with media to destination", message_id)
             return True
-        logger.warning("sendMediaGroup failed: %s, trying individual sends", err)
-        # Fallback: send items individually
-        any_sent = False
-        for idx, (mtype, murl) in enumerate(media_items):
-            caption = text if idx == 0 and text.strip() else ""
-            single_ok = _send_single_media(bot_token, destination_channel, caption, mtype, murl, _send, _download_media, base_url)
-            if single_ok:
-                any_sent = True
-        return any_sent
+        logger.warning("copyMessage failed for post %s", message_id)
+        return False
+    else:
+        # Text-only message
+        if not processed_text.strip():
+            logger.info("Post %s has no text content after processing, skipping", message_id)
+            return False
+        ok = bot.send_message(dest_channel, processed_text)
+        if ok:
+            logger.info("Forwarded text post %s to destination", message_id)
+        return ok
 
-    # ---- CASE 2: Single media item ----
-    if len(media_items) == 1:
-        mtype, murl = media_items[0]
-        return _send_single_media(bot_token, destination_channel, text, mtype, murl, _send, _download_media, base_url)
 
-    # ---- CASE 3: Text only ----
-    if not text.strip():
-        logger.info("Post has no text and no media, skipping send")
+def forward_media_group(bot: TelegramBot, messages: list[dict],
+                        source_channel: str, dest_channel: str) -> bool:
+    """Process and forward a media group (multiple photos/videos in one post)."""
+    # Combine all captions (usually only the first message has a caption)
+    combined_text = ""
+    for msg in messages:
+        t = _get_text(msg)
+        if t.strip():
+            combined_text = t
+            break
+
+    # Process text through OpenAI
+    processed_text = ""
+    if combined_text.strip():
+        processed = asyncio.run(process_text(combined_text))
+        if processed is None:
+            logger.info("Media group skipped by OpenAI filter")
+            return False
+        processed_text = processed
+
+    # Build media group using file_ids (no download!)
+    media = []
+    for idx, msg in enumerate(messages):
+        file_info = _get_file_id(msg)
+        if not file_info:
+            continue
+        media_type, file_id = file_info
+        entry = {
+            "type": media_type,
+            "media": file_id,
+        }
+        # Caption goes only on the first item
+        if idx == 0 and processed_text:
+            entry["caption"] = processed_text
+            entry["parse_mode"] = "Markdown"
+        media.append(entry)
+
+    if not media:
+        logger.warning("Media group has no extractable media")
         return False
 
-    ok, err = _send(
-        f"{base_url}/sendMessage",
-        {"chat_id": destination_channel, "text": text, "parse_mode": "Markdown"},
-    )
-    if not ok:
-        logger.error("Failed to send message to destination: %s", err)
-    return ok
-
-
-def _send_single_media(bot_token, destination_channel, text, media_type, media_url, _send, _download_media, base_url) -> bool:
-    """Send a single photo or video with optional caption."""
-    if media_type == "photo":
-        api_method = "sendPhoto"
-        file_key = "photo"
-        fallback_name = "photo.jpg"
-    else:
-        api_method = "sendVideo"
-        file_key = "video"
-        fallback_name = "video.mp4"
-
-    caption_payload = {}
-    if text.strip():
-        caption_payload = {"caption": text, "parse_mode": "Markdown"}
-
-    # Try download + upload
-    media_bytes, filename, download_err = _download_media(media_url)
-    if media_bytes:
-        ok, err = _send(
-            f"{base_url}/{api_method}",
-            {"chat_id": destination_channel, **caption_payload},
-            files={file_key: (filename or fallback_name, media_bytes.getvalue())},
-        )
-        if ok:
-            return True
-        logger.warning("%s by file failed, trying URL. Error: %s", api_method, err)
-
-    # Try by URL
-    ok, err = _send(
-        f"{base_url}/{api_method}",
-        {"chat_id": destination_channel, file_key: media_url, **caption_payload},
-    )
+    ok = bot.send_media_group(dest_channel, media)
     if ok:
-        return True
-    logger.warning("%s by URL failed, fallback to text. Error: %s", api_method, err)
-
-    # Final fallback: send as text-only
-    if text.strip():
-        ok, err = _send(
-            f"{base_url}/sendMessage",
-            {"chat_id": destination_channel, "text": text, "parse_mode": "Markdown"},
-        )
-        if ok:
-            return True
-        logger.error("Text-only fallback also failed: %s", err)
-    return False
+        logger.info("Forwarded media group (%d items) to destination", len(media))
+    else:
+        logger.warning("sendMediaGroup failed, trying individual copies")
+        # Fallback: copy messages individually
+        any_sent = False
+        for idx, msg in enumerate(messages):
+            caption = processed_text if idx == 0 else None
+            if bot.copy_message(source_channel, dest_channel, msg["message_id"], caption):
+                any_sent = True
+        return any_sent
+    return ok
 
 
 def main() -> None:
@@ -397,52 +246,66 @@ def main() -> None:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing in .env")
 
-    logger.info("Starting monitor")
-    logger.info("Source: %s", SOURCE_CHANNEL)
-    logger.info("Destination: %s", DESTINATION_CHANNEL)
+    bot = TelegramBot(BOT_TOKEN)
+    source = _normalize_channel(SOURCE_CHANNEL)
+    dest = _normalize_channel(DESTINATION_CHANNEL)
 
-    last_seen_message_id: Optional[int] = None
+    logger.info("Starting bot (Bot API polling mode)")
+    logger.info("Source: %s", source)
+    logger.info("Destination: %s", dest)
+
+    # Buffer for media groups: {media_group_id: [messages]}
+    media_group_buffer: dict[str, list[dict]] = {}
+    media_group_times: dict[str, float] = {}
 
     while True:
         try:
-            latest = scrape_latest_post(SOURCE_CHANNEL)
-            if latest is None:
-                time.sleep(CHECK_INTERVAL_SECONDS)
-                continue
+            updates = bot.get_updates()
 
-            message_id, message_text, media_items = latest
+            for update in updates:
+                # Advance offset so we don't re-process
+                update_id = update["update_id"]
+                bot.offset = update_id + 1
 
-            if last_seen_message_id is None:
-                last_seen_message_id = message_id
-                logger.info("Initialized last seen message ID: %s", message_id)
-            elif message_id > last_seen_message_id:
-                logger.info("New post detected: %s", message_id)
-                processed_text = ""
-                if message_text.strip():
-                    processed = asyncio.run(process_text(message_text))
-                    if processed is None:
-                        logger.info("Post %s skipped by OpenAI filter", message_id)
-                        last_seen_message_id = message_id
-                        time.sleep(CHECK_INTERVAL_SECONDS)
-                        continue
-                    processed_text = processed
+                channel_post = update.get("channel_post")
+                if not channel_post:
+                    continue
 
-                sent = send_post_to_destination(
-                    BOT_TOKEN,
-                    DESTINATION_CHANNEL,
-                    processed_text,
-                    media_items=media_items,
-                )
-                if sent:
-                    logger.info("Forwarded new post %s to destination", message_id)
-                last_seen_message_id = message_id
-            else:
-                logger.debug("No new posts")
+                if not _matches_source(channel_post, SOURCE_CHANNEL):
+                    logger.debug("Ignoring post from non-source channel")
+                    continue
+
+                msg_id = channel_post.get("message_id")
+                media_group_id = channel_post.get("media_group_id")
+
+                if media_group_id:
+                    # Part of a media group — buffer it
+                    if media_group_id not in media_group_buffer:
+                        media_group_buffer[media_group_id] = []
+                        media_group_times[media_group_id] = time.time()
+                    media_group_buffer[media_group_id].append(channel_post)
+                    logger.info("Buffered media group item %s (group: %s, items: %d)",
+                                msg_id, media_group_id, len(media_group_buffer[media_group_id]))
+                else:
+                    # Single message — forward immediately
+                    logger.info("New single post detected: %s", msg_id)
+                    forward_single_message(bot, channel_post, source, dest)
+
+            # Check if any media groups are complete (waited long enough)
+            now = time.time()
+            completed_groups = [
+                gid for gid, t in media_group_times.items()
+                if now - t >= MEDIA_GROUP_WAIT
+            ]
+            for gid in completed_groups:
+                messages = media_group_buffer.pop(gid)
+                media_group_times.pop(gid)
+                logger.info("Processing media group %s with %d items", gid, len(messages))
+                forward_media_group(bot, messages, source, dest)
 
         except Exception as exc:
             logger.exception("Unexpected error in polling loop: %s", exc)
-
-        time.sleep(CHECK_INTERVAL_SECONDS)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
