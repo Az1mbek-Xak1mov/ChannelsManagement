@@ -1,370 +1,302 @@
-import logging
-import time
-from typing import Optional
 import asyncio
-from pathlib import Path
+import logging
+import os
+import re
+from collections import defaultdict
 
-import requests
-from config import (
-    ADMIN_USER_IDS,
-    BOT_TOKEN,
-    DESTINATION_CHANNEL,
-    LOG_FILE,
-    OPENAI_API_KEY,
-    SOURCE_CHANNEL,
-)
+from dotenv import load_dotenv
+from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError
+from telethon.sessions import StringSession
+from telethon.tl.custom.message import Message
+from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
 from openai_processor import process_text
+
+
+load_dotenv()
+
+
+# =========================
+# Configuration
+# =========================
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+STRING_SESSION = os.getenv("STRING_SESSION", "")
+PHONE_NUMBER = os.getenv("PHONE_NUMBER", "")
+
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "")
+DESTINATION_CHANNEL = os.getenv("DESTINATION_CHANNEL", "")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+ALBUM_BUFFER_SECONDS = float(os.getenv("ALBUM_BUFFER_SECONDS", "2.5"))
 
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-    ],
 )
-logger = logging.getLogger(__name__)
-
-POLL_TIMEOUT = 30  # long-polling timeout for getUpdates
-MEDIA_GROUP_WAIT = 2  # seconds to wait for more media group messages
+logger = logging.getLogger("telethon-forwarder")
 
 
-class TelegramBot:
-    """Telegram Bot API wrapper for channel forwarding."""
+def validate_config() -> None:
+    """Fail fast when required env vars are missing."""
+    required = {
+        "API_ID": API_ID,
+        "API_HASH": API_HASH,
+        "STRING_SESSION": STRING_SESSION,
+        "SOURCE_CHANNEL": SOURCE_CHANNEL,
+        "DESTINATION_CHANNEL": DESTINATION_CHANNEL,
+        "OPENAI_API_KEY": OPENAI_API_KEY,
+    }
+    missing = [key for key, value in required.items() if not value]
+    if missing:
+        raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
-    def __init__(self, token: str):
-        self.token = token
-        self.base_url = f"https://api.telegram.org/bot{token}"
-        self.offset: Optional[int] = None
 
-    def _call(self, method: str, data: Optional[dict] = None, timeout: int = 60) -> Optional[dict]:
-        """Call Telegram Bot API method."""
-        url = f"{self.base_url}/{method}"
+def normalize_chat(value: str) -> str | int:
+    """Accept @username, username, or numeric ID."""
+    raw = value.strip()
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    return raw if raw.startswith("@") else f"@{raw}"
+
+
+def extract_text_for_ai(message: Message) -> str:
+    """Extract plain text/caption for OpenAI processing."""
+    return message.raw_text or ""
+
+
+def extract_source_links(message: Message) -> list[tuple[int, str]]:
+    """Extract links from source message as (source_word_index, url)."""
+    text = message.raw_text or ""
+    entities = message.entities or []
+    if not text or not entities:
+        return []
+
+    links: list[tuple[int, str]] = []
+
+    for ent in entities:
+        if isinstance(ent, MessageEntityTextUrl):
+            # Hidden URL behind visible word/phrase.
+            prefix = text[:ent.offset]
+            source_word_index = len(re.findall(r"\S+", prefix))
+            links.append((source_word_index, ent.url))
+        elif isinstance(ent, MessageEntityUrl):
+            # Visible URL in text.
+            raw_url = text[ent.offset:ent.offset + ent.length].strip()
+            if raw_url:
+                prefix = text[:ent.offset]
+                source_word_index = len(re.findall(r"\S+", prefix))
+                links.append((source_word_index, raw_url))
+
+    return links
+
+
+def attach_links_to_translated_text(
+    translated_text: str,
+    source_links: list[tuple[int, str]],
+    source_text: str,
+) -> str:
+    """Attach source URLs to nearest translated words, preserving clickable links."""
+    if not translated_text.strip() or not source_links:
+        return translated_text
+
+    if re.search(r"\[[^\]]+\]\([^\)]+\)", translated_text):
+        # OpenAI already preserved at least one markdown link.
+        return translated_text
+
+    src_words = re.findall(r"\S+", source_text)
+    dst_words = list(re.finditer(r"\S+", translated_text))
+    if not dst_words:
+        return translated_text
+
+    src_count = max(len(src_words), 1)
+    dst_count = len(dst_words)
+
+    used_dst_indexes: set[int] = set()
+    chars = list(translated_text)
+
+    # Process from end to start so index replacement does not shift earlier spans.
+    resolved: list[tuple[int, int, str, str]] = []
+    for src_idx, url in source_links:
+        mapped = round((min(max(src_idx, 0), src_count - 1) / src_count) * (dst_count - 1))
+        while mapped in used_dst_indexes and mapped + 1 < dst_count:
+            mapped += 1
+        used_dst_indexes.add(mapped)
+
+        match = dst_words[mapped]
+        resolved.append((match.start(), match.end(), match.group(0), url))
+
+    for start, end, word, url in sorted(resolved, key=lambda x: x[0], reverse=True):
+        safe_word = word.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+        safe_url = url.replace(")", "%29")
+        linked = f"[{safe_word}]({safe_url})"
+        chars[start:end] = list(linked)
+
+    return "".join(chars)
+
+
+async def main() -> None:
+    validate_config()
+
+    source_ref = normalize_chat(SOURCE_CHANNEL)
+    destination_ref = normalize_chat(DESTINATION_CHANNEL)
+
+    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        logger.warning("Provided StringSession is not authorized.")
+        if not PHONE_NUMBER:
+            raise RuntimeError(
+                "StringSession is not authorized and PHONE_NUMBER is missing. "
+                "Set PHONE_NUMBER and rerun to generate a new session."
+            )
+
+        logger.info("Requesting login code for %s", PHONE_NUMBER)
+        await client.send_code_request(PHONE_NUMBER)
+        code = input("Enter Telegram login code: ").strip()
+
         try:
-            resp = requests.post(url, json=data or {}, timeout=timeout)
-            result = resp.json()
-            if not result.get("ok"):
-                logger.error("API %s failed: %s", method, result.get("description"))
-                return None
-            return result.get("result")
-        except requests.RequestException as exc:
-            logger.error("API %s request failed: %s", method, exc)
-            return None
+            await client.sign_in(phone=PHONE_NUMBER, code=code)
+        except SessionPasswordNeededError:
+            password = input("Enter 2FA password: ").strip()
+            await client.sign_in(password=password)
 
-    def get_updates(self) -> list[dict]:
-        """Long-poll for new updates."""
-        data = {
-            "timeout": POLL_TIMEOUT,
-            "allowed_updates": ["channel_post", "message"],
-        }
-        if self.offset is not None:
-            data["offset"] = self.offset
-        result = self._call("getUpdates", data, timeout=POLL_TIMEOUT + 10)
-        return result if result else []
+        new_session = client.session.save()
+        logger.info("Authorization successful.")
+        print("\nNew STRING_SESSION (save this to .env):")
+        print(new_session)
 
-    def send_message(self, chat_id: str | int, text: str,
-                     parse_mode: Optional[str] = "Markdown") -> bool:
-        """Send a text message."""
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-        }
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
-        result = self._call("sendMessage", payload)
-        return result is not None
+    source_entity = await client.get_entity(source_ref)
+    destination_entity = await client.get_entity(destination_ref)
 
-    def copy_message(self, from_chat: str, to_chat: str, message_id: int,
-                     caption: Optional[str] = None) -> bool:
-        """Copy a message from one chat to another, optionally with new caption."""
-        data = {
-            "chat_id": to_chat,
-            "from_chat_id": from_chat,
-            "message_id": message_id,
-        }
-        if caption is not None:
-            data["caption"] = caption
-            data["parse_mode"] = "Markdown"
-        result = self._call("copyMessage", data)
-        return result is not None
+    logger.info("User client started")
+    logger.info("Source channel: %s (id=%s)", SOURCE_CHANNEL, source_entity.id)
+    logger.info("Destination channel: %s", DESTINATION_CHANNEL)
 
-    def send_media_group(self, chat_id: str, media: list[dict]) -> bool:
-        """Send a media group (multiple photos/videos)."""
-        result = self._call("sendMediaGroup", {
-            "chat_id": chat_id,
-            "media": media,
-        })
-        return result is not None
+    # grouped_id -> list[Message]
+    album_buffers: dict[int, list[Message]] = defaultdict(list)
+    # grouped_id -> asyncio.Task
+    album_tasks: dict[int, asyncio.Task] = {}
 
+    async def flush_album(grouped_id: int) -> None:
+        """Wait briefly, then send buffered album as one media group."""
+        await asyncio.sleep(ALBUM_BUFFER_SECONDS)
 
-def _get_file_id(message: dict) -> Optional[tuple[str, str]]:
-    """Extract (media_type, file_id) from a message.
+        messages = album_buffers.pop(grouped_id, [])
+        album_tasks.pop(grouped_id, None)
 
-    Returns:
-        ("photo", file_id) or ("video", file_id) or ("document", file_id)
-        or ("animation", file_id) or None
-    """
-    if "photo" in message:
-        # photo is an array of sizes, take the largest
-        return "photo", message["photo"][-1]["file_id"]
-    if "video" in message:
-        return "video", message["video"]["file_id"]
-    if "animation" in message:
-        return "animation", message["animation"]["file_id"]
-    if "document" in message:
-        return "document", message["document"]["file_id"]
-    if "audio" in message:
-        return "audio", message["audio"]["file_id"]
-    if "voice" in message:
-        return "voice", message["voice"]["file_id"]
-    if "video_note" in message:
-        return "video_note", message["video_note"]["file_id"]
-    return None
+        if not messages:
+            return
 
+        messages.sort(key=lambda m: m.id)
+        logger.info("Processing album grouped_id=%s items=%d", grouped_id, len(messages))
 
-def _get_text(message: dict) -> str:
-    """Get text or caption from a message."""
-    return message.get("text") or message.get("caption") or ""
+        original_text = ""
+        source_for_links = None
+        for msg in messages:
+            candidate = extract_text_for_ai(msg)
+            if candidate.strip():
+                original_text = candidate
+                source_for_links = msg
+                break
 
+        new_text = ""
+        if original_text.strip():
+            try:
+                processed = await process_text(original_text)
+            except Exception as exc:
+                logger.exception("OpenAI failed for album grouped_id=%s: %s", grouped_id, exc)
+                return
 
-def _get_source_chat_id(message: dict) -> Optional[int]:
-    """Get the chat ID from a channel post."""
-    chat = message.get("chat", {})
-    return chat.get("id")
+            if processed is None:
+                logger.info("Album grouped_id=%s skipped by OpenAI", grouped_id)
+                return
+            new_text = processed
+            if source_for_links is not None:
+                links = extract_source_links(source_for_links)
+                new_text = attach_links_to_translated_text(new_text, links, original_text)
 
+        media_objects = [m.media for m in messages if m.media is not None]
+        if not media_objects:
+            logger.warning("Album grouped_id=%s has no media, skipping", grouped_id)
+            return
 
-def _normalize_channel(channel: str) -> str:
-    """Normalize channel identifier — ensure @ prefix for usernames."""
-    channel = channel.strip()
-    if channel.startswith("-100") or channel.startswith("-"):
-        return channel  # numeric ID
-    if not channel.startswith("@"):
-        return f"@{channel}"
-    return channel
-
-
-def _matches_source(message: dict, source_channel: str) -> bool:
-    """Check if a channel_post is from our source channel."""
-    chat = message.get("chat", {})
-    username = chat.get("username", "")
-    chat_id = str(chat.get("id", ""))
-
-    source = source_channel.strip().lstrip("@")
-    return username == source or chat_id == source or chat_id == f"-100{source}"
-
-
-def _tail_lines(file_path: str, line_count: int = 10) -> str:
-    """Return last N lines from a log file."""
-    path = Path(file_path)
-    if not path.exists():
-        return f"Log file not found: {file_path}"
-
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-        tail = "".join(lines[-line_count:]).strip()
-        return tail or "Log file is empty."
-    except Exception as exc:
-        logger.exception("Failed to read log file: %s", exc)
-        return "Failed to read log file."
-
-
-def handle_admin_check_message(bot: TelegramBot, message: dict) -> bool:
-    """Send last 10 log lines to authorized users."""
-    user = message.get("from", {})
-    user_id = user.get("id")
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
-    text = (message.get("text") or "").strip().lower()
-
-    if user_id not in ADMIN_USER_IDS:
-        return False
-
-    if text not in {"/logs", "/check", "/status", "logs", "check", "status"}:
-        return False
-
-    logs = _tail_lines(LOG_FILE, 10)
-    response = f"Last 10 log lines:\n{logs}"
-    sent = bot.send_message(chat_id, response, parse_mode=None)
-    if sent:
-        logger.info("Sent last 10 logs to admin user %s", user_id)
-    return sent
-
-
-def forward_single_message(bot: TelegramBot, message: dict,
-                           source_channel: str, dest_channel: str) -> bool:
-    """Process and forward a single message (no media group)."""
-    original_text = _get_text(message)
-    has_media = _get_file_id(message) is not None
-    message_id = message.get("message_id")
-
-    # Process text through OpenAI
-    processed_text = ""
-    if original_text.strip():
-        processed = asyncio.run(process_text(original_text))
-        if processed is None:
-            logger.info("Post %s skipped by OpenAI filter", message_id)
-            return False
-        processed_text = processed
-
-    if has_media:
-        # Copy message with new caption (preserves media via file_id, no download)
-        ok = bot.copy_message(
-            from_chat=source_channel,
-            to_chat=dest_channel,
-            message_id=message_id,
-            caption=processed_text if processed_text else None,
+        # Zero-download media forwarding: pass media objects directly.
+        await client.send_file(
+            destination_entity,
+            file=media_objects,
+            caption=new_text if new_text else None,
+            parse_mode="md",
         )
-        if ok:
-            logger.info("Forwarded post %s with media to destination", message_id)
-            return True
-        logger.warning("copyMessage failed for post %s", message_id)
-        return False
-    else:
-        # Text-only message
-        if not processed_text.strip():
-            logger.info("Post %s has no text content after processing, skipping", message_id)
-            return False
-        ok = bot.send_message(dest_channel, processed_text)
-        if ok:
-            logger.info("Forwarded text post %s to destination", message_id)
-        return ok
+        logger.info("Forwarded album grouped_id=%s", grouped_id)
 
+    @client.on(events.NewMessage(chats=source_entity))
+    async def on_new_message(event: events.NewMessage.Event) -> None:
+        """Handle new source-channel messages and forward to destination."""
+        message = event.message
 
-def forward_media_group(bot: TelegramBot, messages: list[dict],
-                        source_channel: str, dest_channel: str) -> bool:
-    """Process and forward a media group (multiple photos/videos in one post)."""
-    # Combine all captions (usually only the first message has a caption)
-    combined_text = ""
-    for msg in messages:
-        t = _get_text(msg)
-        if t.strip():
-            combined_text = t
-            break
+        logger.info(
+            "Received message id=%s grouped_id=%s chat_id=%s out=%s post=%s",
+            message.id,
+            message.grouped_id,
+            event.chat_id,
+            message.out,
+            message.post,
+        )
 
-    # Process text through OpenAI
-    processed_text = ""
-    if combined_text.strip():
-        processed = asyncio.run(process_text(combined_text))
-        if processed is None:
-            logger.info("Media group skipped by OpenAI filter")
-            return False
-        processed_text = processed
+        # Album/media-group: buffer by grouped_id and flush once.
+        if message.grouped_id is not None:
+            gid = int(message.grouped_id)
+            album_buffers[gid].append(message)
 
-    # Build media group using file_ids (no download!)
-    media = []
-    for idx, msg in enumerate(messages):
-        file_info = _get_file_id(msg)
-        if not file_info:
-            continue
-        media_type, file_id = file_info
-        entry = {
-            "type": media_type,
-            "media": file_id,
-        }
-        # Caption goes only on the first item
-        if idx == 0 and processed_text:
-            entry["caption"] = processed_text
-            entry["parse_mode"] = "Markdown"
-        media.append(entry)
+            if gid not in album_tasks:
+                album_tasks[gid] = asyncio.create_task(flush_album(gid))
+            return
 
-    if not media:
-        logger.warning("Media group has no extractable media")
-        return False
+        original_text = extract_text_for_ai(message)
+        new_text = ""
 
-    ok = bot.send_media_group(dest_channel, media)
-    if ok:
-        logger.info("Forwarded media group (%d items) to destination", len(media))
-    else:
-        logger.warning("sendMediaGroup failed, trying individual copies")
-        # Fallback: copy messages individually
-        any_sent = False
-        for idx, msg in enumerate(messages):
-            caption = processed_text if idx == 0 else None
-            if bot.copy_message(source_channel, dest_channel, msg["message_id"], caption):
-                any_sent = True
-        return any_sent
-    return ok
+        if original_text.strip():
+            try:
+                processed = await process_text(original_text)
+            except Exception as exc:
+                logger.exception("OpenAI failed for message id=%s: %s", message.id, exc)
+                return
 
+            if processed is None:
+                logger.info("Message id=%s skipped by OpenAI", message.id)
+                return
+            new_text = processed
+            links = extract_source_links(message)
+            new_text = attach_links_to_translated_text(new_text, links, original_text)
 
-def main() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing in .env")
-    if not SOURCE_CHANNEL:
-        raise RuntimeError("SOURCE_CHANNEL is missing in .env")
-    if not DESTINATION_CHANNEL:
-        raise RuntimeError("DESTINATION_CHANNEL is missing in .env")
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is missing in .env")
+        # Zero-download media forwarding.
+        if message.media is not None:
+            await client.send_file(
+                destination_entity,
+                file=message.media,
+                caption=new_text if new_text else None,
+                parse_mode="md",
+            )
+            logger.info("Forwarded media message id=%s", message.id)
+            return
 
-    bot = TelegramBot(BOT_TOKEN)
-    source = _normalize_channel(SOURCE_CHANNEL)
-    dest = _normalize_channel(DESTINATION_CHANNEL)
+        # Text-only forwarding.
+        if new_text.strip():
+            await client.send_message(destination_entity, new_text, parse_mode="md")
+            logger.info("Forwarded text message id=%s", message.id)
+        else:
+            logger.info("Message id=%s has no text and no media, skipped", message.id)
 
-    logger.info("Starting bot (Bot API polling mode)")
-    logger.info("Source: %s", source)
-    logger.info("Destination: %s", dest)
-    logger.info("Admin check enabled for user IDs: %s", sorted(ADMIN_USER_IDS))
-
-    # Buffer for media groups: {media_group_id: [messages]}
-    media_group_buffer: dict[str, list[dict]] = {}
-    media_group_times: dict[str, float] = {}
-
-    while True:
-        try:
-            updates = bot.get_updates()
-
-            for update in updates:
-                # Advance offset so we don't re-process
-                update_id = update["update_id"]
-                bot.offset = update_id + 1
-
-                message = update.get("message")
-                if message:
-                    handle_admin_check_message(bot, message)
-                    continue
-
-                channel_post = update.get("channel_post")
-                if not channel_post:
-                    continue
-
-                if not _matches_source(channel_post, SOURCE_CHANNEL):
-                    logger.debug("Ignoring post from non-source channel")
-                    continue
-
-                msg_id = channel_post.get("message_id")
-                media_group_id = channel_post.get("media_group_id")
-
-                if media_group_id:
-                    # Part of a media group — buffer it
-                    if media_group_id not in media_group_buffer:
-                        media_group_buffer[media_group_id] = []
-                        media_group_times[media_group_id] = time.time()
-                    media_group_buffer[media_group_id].append(channel_post)
-                    logger.info("Buffered media group item %s (group: %s, items: %d)",
-                                msg_id, media_group_id, len(media_group_buffer[media_group_id]))
-                else:
-                    # Single message — forward immediately
-                    logger.info("New single post detected: %s", msg_id)
-                    forward_single_message(bot, channel_post, source, dest)
-
-            # Check if any media groups are complete (waited long enough)
-            now = time.time()
-            completed_groups = [
-                gid for gid, t in media_group_times.items()
-                if now - t >= MEDIA_GROUP_WAIT
-            ]
-            for gid in completed_groups:
-                messages = media_group_buffer.pop(gid)
-                media_group_times.pop(gid)
-                logger.info("Processing media group %s with %d items", gid, len(messages))
-                forward_media_group(bot, messages, source, dest)
-
-        except Exception as exc:
-            logger.exception("Unexpected error in polling loop: %s", exc)
-            time.sleep(5)
+    logger.info("Listening for new posts...")
+    await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
