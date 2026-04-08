@@ -1,17 +1,28 @@
 import logging
 import time
-import json
 from typing import Optional
 import asyncio
+from pathlib import Path
 
 import requests
-from config import BOT_TOKEN, SOURCE_CHANNEL, DESTINATION_CHANNEL, OPENAI_API_KEY
+from config import (
+    ADMIN_USER_IDS,
+    BOT_TOKEN,
+    DESTINATION_CHANNEL,
+    LOG_FILE,
+    OPENAI_API_KEY,
+    SOURCE_CHANNEL,
+)
 from openai_processor import process_text
 
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -45,20 +56,23 @@ class TelegramBot:
         """Long-poll for new updates."""
         data = {
             "timeout": POLL_TIMEOUT,
-            "allowed_updates": ["channel_post"],
+            "allowed_updates": ["channel_post", "message"],
         }
         if self.offset is not None:
             data["offset"] = self.offset
         result = self._call("getUpdates", data, timeout=POLL_TIMEOUT + 10)
         return result if result else []
 
-    def send_message(self, chat_id: str, text: str) -> bool:
+    def send_message(self, chat_id: str | int, text: str,
+                     parse_mode: Optional[str] = "Markdown") -> bool:
         """Send a text message."""
-        result = self._call("sendMessage", {
+        payload = {
             "chat_id": chat_id,
             "text": text,
-            "parse_mode": "Markdown",
-        })
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        result = self._call("sendMessage", payload)
         return result is not None
 
     def copy_message(self, from_chat: str, to_chat: str, message_id: int,
@@ -138,6 +152,44 @@ def _matches_source(message: dict, source_channel: str) -> bool:
 
     source = source_channel.strip().lstrip("@")
     return username == source or chat_id == source or chat_id == f"-100{source}"
+
+
+def _tail_lines(file_path: str, line_count: int = 10) -> str:
+    """Return last N lines from a log file."""
+    path = Path(file_path)
+    if not path.exists():
+        return f"Log file not found: {file_path}"
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        tail = "".join(lines[-line_count:]).strip()
+        return tail or "Log file is empty."
+    except Exception as exc:
+        logger.exception("Failed to read log file: %s", exc)
+        return "Failed to read log file."
+
+
+def handle_admin_check_message(bot: TelegramBot, message: dict) -> bool:
+    """Send last 10 log lines to authorized users."""
+    user = message.get("from", {})
+    user_id = user.get("id")
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    text = (message.get("text") or "").strip().lower()
+
+    if user_id not in ADMIN_USER_IDS:
+        return False
+
+    if text not in {"/logs", "/check", "/status", "logs", "check", "status"}:
+        return False
+
+    logs = _tail_lines(LOG_FILE, 10)
+    response = f"Last 10 log lines:\n{logs}"
+    sent = bot.send_message(chat_id, response, parse_mode=None)
+    if sent:
+        logger.info("Sent last 10 logs to admin user %s", user_id)
+    return sent
 
 
 def forward_single_message(bot: TelegramBot, message: dict,
@@ -253,6 +305,7 @@ def main() -> None:
     logger.info("Starting bot (Bot API polling mode)")
     logger.info("Source: %s", source)
     logger.info("Destination: %s", dest)
+    logger.info("Admin check enabled for user IDs: %s", sorted(ADMIN_USER_IDS))
 
     # Buffer for media groups: {media_group_id: [messages]}
     media_group_buffer: dict[str, list[dict]] = {}
@@ -266,6 +319,11 @@ def main() -> None:
                 # Advance offset so we don't re-process
                 update_id = update["update_id"]
                 bot.offset = update_id + 1
+
+                message = update.get("message")
+                if message:
+                    handle_admin_check_message(bot, message)
+                    continue
 
                 channel_post = update.get("channel_post")
                 if not channel_post:

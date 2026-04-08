@@ -31,6 +31,8 @@ Required variables:
 - `SOURCE_CHANNEL`: Channel username to listen 
 - `DESTINATION_CHANNEL`: Channel username to publish
 - `OPENAI_MODEL`: OpenAI model name (default: `gpt-5.4`)
+- `ADMIN_USER_IDS`: Comma-separated Telegram user IDs allowed to request logs
+- `LOG_FILE`: Log file path (default: `bot.log`)
 
 ### 3. Bot Permissions
 
@@ -61,3 +63,8 @@ Set values in `.env` to change:
 - `SOURCE_CHANNEL`: Channel to listen to
 - `DESTINATION_CHANNEL`: Channel to publish to
 - `OPENAI_MODEL`: OpenAI model to use (default: `gpt-5.4`)
+
+## Admin Check Command
+
+Authorized users (from `ADMIN_USER_IDS`) can send `/logs`, `/check`, or `/status` to the bot in private chat.
+The bot replies with the last 10 lines from `LOG_FILE`.
